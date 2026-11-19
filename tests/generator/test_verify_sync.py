@@ -98,6 +98,7 @@ def _mtp_generator(monkeypatch, calls, verify):
     g.prefill_cooldown = g.prefill_cooldown_left = g.prefill_rotation = 0
     g.draft_model, g.mtp_draft, g.dflash_draft = object(), True, False
     g.num_draft_tokens, g.draft_max_rows, g.hybrid_draft_tokens, g.disk_cache_write_interval = 3, 0, 0, 0
+    g.dynamic_draft = False
     g.model = SimpleNamespace(config = SimpleNamespace())
     g.iterate_draftmodel_mtp_gen = lambda results, window: None
     g.iterate_gen = lambda results, draft_tokens = None: verify(g)
