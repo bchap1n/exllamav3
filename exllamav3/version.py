@@ -1,1 +1,1 @@
-__version__ = "1.6.6+beellama"
+__version__ = "1.6.7+beellama"
