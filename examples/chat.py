@@ -3,6 +3,7 @@ from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import time
 from pathlib import Path
 import tempfile
 import webbrowser
@@ -89,12 +90,20 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        hybrid_draft_tokens = args.hybrid_draft_tokens,
+        ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
         dynamic_draft_skip_ema = args.draft_skip_ema,
+        sparse_draft_head = args.sparse_draft_head,
+        draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        disk_cache_dir = args.disk_cache_dir,
+        disk_cache_size = int(args.disk_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
         show_visualizer = args.visualize_cache,
+        max_chunk_size = args.generator_chunk_size,
     )
+    vra_last = None   # previous /vra report, for the delta column
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
         stop_conditions += config.eos_token_id_list
@@ -169,6 +178,7 @@ def main(args):
                         "/t                 Tokenize context",
                         "/think             Toggle reasoning mode",
                         "/tps               Toggle tokens/second output",
+                        "/vra               VRAM accounting per device, with deltas since the previous /vra",
                         "/x                 Exit",
                     ]))
                     continue
@@ -248,6 +258,9 @@ def main(args):
 
                 # Edit last response
                 case "/e":
+                    if len(context) == 0:
+                        print_error(f"Context is empty, nothing to edit")
+                        continue
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
@@ -272,6 +285,15 @@ def main(args):
                 # Page table/cache
                 case "/ppt":
                     print_info(generator.pagetable.dump_page_list())
+                    continue
+
+                # VRAM accounting (with deltas against the previous /vra)
+                case "/vra":
+                    from exllamav3.util.memory import vram_accounting, format_vram_report
+                    vra_now = vram_accounting(model, cache, generator)
+                    print()
+                    print(format_vram_report(vra_now, previous = vra_last))
+                    vra_last = vra_now
                     continue
 
                 # Edit system prompt
@@ -317,8 +339,8 @@ def main(args):
                 case "/save_ids":
                     if last_input_ids is None:
                         print_error(f"No IDs to save")
-                    else:
-                        d = {"ids": last_input_ids}
+                        continue
+                    d = {"ids": last_input_ids}
                     save_file(d, "last_ids.safetensors")
                     print_info(f"Saved IDs to last_ids.safetensors")
                     continue
@@ -398,16 +420,16 @@ def main(args):
                 case "/load":
                     if len(c) == 1:
                         c.append("~/chat_py_session.json")
-                        try:
-                            (
-                                system_prompt,
-                                banned_strings,
-                                context
-                            ) = load_session(c[1])
-                            print_info(f"Loaded session from: {c[1]}")
-                        except:
-                            print_error(f"Error loading {c[1]}")
-                        continue
+                    try:
+                        (
+                            system_prompt,
+                            banned_strings,
+                            context
+                        ) = load_session(c[1])
+                        print_info(f"Loaded session from: {c[1]}")
+                    except:
+                        print_error(f"Error loading {c[1]}")
+                    continue
 
                 # Print token IDs for last response
                 case "/t":
@@ -436,7 +458,7 @@ def main(args):
 
                 # Multiple completions test
                 case "/n":
-                    num_completions = int(c[1]) if len(c) > 1 else "0"
+                    num_completions = int(c[1]) if len(c) > 1 else 1
                     user_prompt = " ".join(c[2:])
 
                 # Needle in haystack prompt
@@ -463,7 +485,7 @@ def main(args):
             frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
                 frm_context += prefix
-            elif think and prompt_format.thinktag()[0] is not None:
+            elif think and prompt_format.thinktag()[0] is not None and prompt_format.inject_thinktag():
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
@@ -504,7 +526,7 @@ def main(args):
             banned_strings = banned_strings,
             token_healing = enable_healing,
             return_logits = save_probs > 0,
-            stop_on_loop = (args.loop_window, args.loop_min_reps),
+            stop_on_loop = True,
             identifier = n,
         ) for n in range(num_completions)]
         generator.enqueue(jobs)
@@ -513,6 +535,7 @@ def main(args):
         saved_samples = []
 
         completions = ["" for _ in range(num_completions)]
+        finished = []  # (time of the final result, final result) per completion
 
         # Stream response
         stop_reason = None
@@ -528,6 +551,8 @@ def main(args):
                     if bid is None: continue
                     chunk = r.get("text", "")
                     completions[bid] += chunk
+                    if r["eos"]:
+                        finished.append((time.perf_counter(), r))
                     if bid != 0: continue
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
@@ -597,6 +622,18 @@ def main(args):
                 print_info(f"Completion {i+1} / {num_completions}")
                 print("\n" + completions[i])
 
+            # Aggregate generation throughput: all new tokens over the span from the first completion's first
+            # generated token to the last completion's end (prefill excluded)
+            if len(finished) == num_completions:
+                total_tokens = sum(fr["new_tokens"] for _, fr in finished)
+                span = max(t for t, _ in finished) - min(t - fr["time_generate"] for t, fr in finished)
+                if span > 0:
+                    print(
+                        f"\nBatch: {col_info}{num_completions}{col_default} completions, "
+                        f"{col_info}{total_tokens:,}{col_default} tokens in {col_info}{span:.2f}{col_default} s, "
+                        f"{col_info}{total_tokens / span:.2f}{col_default} t/s aggregate"
+                    )
+
         # Add response to context
         response = s.all_text.strip()
 
@@ -646,8 +683,7 @@ if __name__ == "__main__":
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
-    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
-    parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
+    parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     _args = parser.parse_args()
     main(_args)

@@ -11,7 +11,53 @@ from ..util import profile_opt
 if TYPE_CHECKING:
     from . import MMEmbedding
 
+# The Rust backend's thread pool stays off by default (it is a per-call setting the library reads from
+# the environment, and the warning it prints after a fork is noise for host applications); the long-input
+# path below turns it on around its own batched call only
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Long inputs are cut into chunks at newline runs and encoded as one parallel batch. The backend's single-
+# sequence encode is single-threaded, and the parallel batch over the chunks gives the same ids as long as
+# every cut falls on a pre-token boundary: a complete run of newlines is one on every pre-tokenizer seen
+# (GPT-style regexes keep newline runs as their own pre-token and attach leading spaces to the following
+# word, Metaspace splits on the whitespace), and a probe is checked per tokenizer before the first use
+# anyway. Inputs below the threshold are not worth the pool's fork/join
+_CHUNK_MIN_CHARS = 32768
+_CHUNK_TARGET_CHARS = 16384
+_CHUNK_MAX = 128
+_CHUNK_PROBE = (
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n    def f(x):\n        return x  \n\n\n"
+    "Tabs\there\r\nand CRLF.\r\n\r\nCRLF blank line.\n  leading spaces\ntrailing spaces   \n\n日本語のテキスト\n\nЁлки-палки, 12345 678\n"
+    "<|im_start|>user\nmixed <s> markup </s>\n\n\n\nend"
+) * 3
+
+
+def _split_chunks(text: str, target: int = _CHUNK_TARGET_CHARS, max_chunks: int = _CHUNK_MAX) -> list[str]:
+    """Cut text after complete newline runs, about every `target` characters. Text without a newline
+    past a cut point simply runs on into the next chunk. A run takes in carriage returns too: a CRLF
+    blank line is one token to some tokenizers, and a cut inside it would make the chunked encoding
+    (and so a growing prompt's prefix) differ from the whole-text encoding (issue #564)"""
+    n = len(text)
+    k = min(max_chunks, max(1, n // target))
+    if k <= 1:
+        return [text]
+    step = n // k
+    out, start = [], 0
+    for _ in range(k - 1):
+        p = text.find("\n", start + step)
+        if p < 0:
+            break
+        while p < n and text[p] in "\r\n":
+            p += 1
+        if p > start:
+            out.append(text[start:p])
+            start = p
+        if start >= n:
+            break
+    if start < n:
+        out.append(text[start:])
+    return out
+
 
 class Tokenizer:
 
@@ -53,7 +99,10 @@ class Tokenizer:
         self.added_tokens_dict = maybe_read_json(self.path_added_tokens_json)
 
         # Disable truncation
+        # tokenizer.json may carry padding and truncation settings from whatever produced it
+        # (DeepSeek-V4's pads every encode to 512 with EOS); neither belongs in a prompt encoder
         self.tokenizer.no_truncation()
+        self.tokenizer.no_padding()
 
         # Deduce placeholders used for space and newline chars in raw vocabulary
         self.space_char_ = " "
@@ -140,8 +189,9 @@ class Tokenizer:
         self.bos_token_id = get_default_token_id("bos_token", self.bos_token_id, 1)
         self.eos_token_id = get_default_token_id("eos_token", self.eos_token_id, 2)
 
-        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json
-        e = get_default_token_id("eos_token", None, 2)
+        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json (no eos_token there:
+        # leave config.json alone rather than forcing the id-2 fallback onto it)
+        e = get_default_token_id("eos_token", None, None)
         if e:
             if config.eos_token_id != e:
                 config.eos_token_id = e
@@ -167,7 +217,7 @@ class Tokenizer:
         # Use "<pad>" or BOS token as fallback for padding token
         if self.pad_token_id is None:
             pad_test = self.tokenizer.token_to_id("<pad>")
-            if pad_test:
+            if pad_test is not None:   # id 0 is a valid <pad>
                 self.pad_token_id = pad_test
             elif self.eos_token_id != self.bos_token_id:
                 self.pad_token_id = self.eos_token_id
@@ -251,20 +301,82 @@ class Tokenizer:
         return tid
 
     # Encode string with added, unspecial tokens
+    def _chunking_ok(self) -> bool:
+        """Whether cutting at newline runs reproduces this tokenizer's single-sequence ids, decided once
+        on the probe text, cut after every one of its newline runs (both special-token modes). Cutting
+        at every run rather than at a few length-dependent positions exercises each boundary kind the
+        probe contains (indented lines, trailing spaces, CRLF runs, markup) whatever the probe's length"""
+        ok = getattr(self, "_chunking_verified", None)
+        if ok is None:
+            ok = True
+            previous_mode = self.tokenizer.encode_special_tokens
+            try:
+                for special in (False, True):
+                    self.tokenizer.encode_special_tokens = not special
+                    ref = self.tokenizer.encode(_CHUNK_PROBE, add_special_tokens = False).ids
+                    parts = _split_chunks(_CHUNK_PROBE, target = 1, max_chunks = len(_CHUNK_PROBE))
+                    encs = self.tokenizer.encode_batch(parts, add_special_tokens = False)
+                    if [i for e in encs for i in e.ids] != ref:
+                        ok = False
+            finally:
+                # The actual input must still use the mode selected by encode_part_base.
+                self.tokenizer.encode_special_tokens = previous_mode
+            self._chunking_verified = ok
+        return ok
+
+    def _encode_texts(self, texts: list[str]) -> list[list[int]]:
+        """Backend encode of several texts (special-token mode already set on the backend). Long
+        texts are cut at newline runs and everything goes through one batch call with the backend's
+        parallelism on, so a single long prompt is spread over the cores; short inputs take the
+        plain call"""
+        if sum(len(t) for t in texts) < _CHUNK_MIN_CHARS or len(texts) == 1 and len(texts[0]) < _CHUNK_MIN_CHARS:
+            return [self.tokenizer.encode(t, add_special_tokens = False).ids for t in texts]
+        chunk = self._chunking_ok()
+        groups = [_split_chunks(t) if chunk and len(t) >= _CHUNK_MIN_CHARS else [t] for t in texts]
+        flat = [c for g in groups for c in g]
+        prev = os.environ.get("TOKENIZERS_PARALLELISM")
+        os.environ["TOKENIZERS_PARALLELISM"] = "true"
+        try:
+            encs = self.tokenizer.encode_batch(flat, add_special_tokens = False)
+        finally:
+            if prev is None:
+                del os.environ["TOKENIZERS_PARALLELISM"]
+            else:
+                os.environ["TOKENIZERS_PARALLELISM"] = prev
+        out, i = [], 0
+        for g in groups:
+            ids = []
+            for _ in g:
+                ids += encs[i].ids
+                i += 1
+            out.append(ids)
+        return out
+
     def encode_part_base(self, text: str, special: bool) -> list[int]:
+        # BOS/EOS insertion is owned by encode() (add_bos/add_eos), so the backend must never run
+        # its post-processor template: llama3-lineage tokenizer.json files carry a
+        # TemplateProcessing step that would prepend BOS regardless of add_bos. The
+        # encode_special_tokens flag instead maps to the backend's split-special-tokens mode,
+        # which encodes special-token strings in the input as plain text when the flag is False
+        self.tokenizer.encode_special_tokens = not special
         if not self.unspecial_piece_to_id:
-            return self.tokenizer.encode(text, add_special_tokens = special).ids
+            return self._encode_texts([text])[0]
 
         if self.unspecial_delimiters is None:
             self.unspecial_delimiters = re.compile(
                 "(" + "|".join(map(re.escape, self.unspecial_piece_to_id.keys())) + ")")
 
         split = self.unspecial_delimiters.split(text)
+        # The text pieces between the matched tokens go through one batch call
+        pieces = self._encode_texts([split[i] for i in range(0, len(split), 2) if split[i] != ""])
         encoded = []
 
         i = 0
+        j = 0
         while i < len(split):
-            if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = special).ids
+            if split[i] != "":
+                encoded += pieces[j]
+                j += 1
             if i + 1 < len(split): encoded += [self.unspecial_piece_to_id[split[i + 1]]]
             i += 2
 
@@ -298,8 +410,11 @@ class Tokenizer:
         self,
         text: str,
         special: bool,
-        embeddings: list[MMEmbedding]
+        embeddings: list[MMEmbedding],
+        position_offset: int = 0,
     ):
+        """position_offset: prompt position of the first id produced here (1 when a BOS token
+        will be prepended), so position-aligned embeddings land on the right phase."""
         out_parts = []
 
         if embeddings:
@@ -312,7 +427,7 @@ class Tokenizer:
 
         for text in in_parts:
             if text in aliases:
-                out_parts += aliases[text].token_list
+                out_parts += aliases[text].token_list_at(position_offset + len(out_parts))
             else:
                 out_parts += self.encode_part(text, special)
 
@@ -363,7 +478,8 @@ class Tokenizer:
 
             # text is a list of strings
 
-            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings) for t in text]
+            pos0 = 1 if add_bos and self.bos_token_id is not None else 0
+            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings, pos0) for t in text]
 
             if add_bos and self.bos_token_id is not None:
                 for ids in list_ids: ids.insert(0, self.bos_token_id)
@@ -376,8 +492,8 @@ class Tokenizer:
             offsets = []
             for ids in list_ids:
                 padding_length = max_length - len(ids)
-                padding = torch.full((padding_length,), self.pad_token_id)
-                padded_ids.append(torch.cat((padding, torch.tensor(ids)), dim=0))
+                padding = torch.full((padding_length,), self.pad_token_id, dtype = torch.long)
+                padded_ids.append(torch.cat((padding, torch.tensor(ids, dtype = torch.long)), dim=0))
                 offsets.append(-padding_length)
 
             stacked_ids = torch.stack(padded_ids, dim=0)
@@ -392,13 +508,16 @@ class Tokenizer:
             # text is a single string
 
             # ids = self.encode_special(text) if encode_special_tokens else self.encode_unspecial(text)
-            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings)
+            pos0 = 1 if add_bos and self.bos_token_id is not None else 0
+            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings, pos0)
             if add_bos and self.bos_token_id is not None:
                 ids.insert(0, self.bos_token_id)
             if add_eos and self.eos_token_id is not None:
                 ids.append(self.eos_token_id)
 
-            ids = torch.tensor(ids).to(torch.long).unsqueeze(0)
+            # Typed construction straight from the list: an untyped tensor plus .to() builds the
+            # tensor twice, which is most of the Python cost of a long prompt
+            ids = torch.tensor(ids, dtype = torch.long).unsqueeze(0)
             if return_offsets:
                 return ids, torch.tensor([0], dtype=torch.int)
             else:
@@ -445,7 +564,7 @@ class Tokenizer:
             end = 0
             while end < len(seq):
                 if seq[end] in self.extended_id_to_piece:
-                    if end > start: text += self.tokenizer.decode(seq[start: end], decode_special_tokens)
+                    if end > start: text += self.tokenizer.decode(seq[start: end], skip_special_tokens = not decode_special_tokens)
                     text += self.extended_id_to_piece[seq[end]]
                     end += 1
                     start = end

@@ -45,6 +45,7 @@ class SamplingState:
     probs: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     past_ids: torch.Tensor | None = None
+    tokenizer: Tokenizer | None = None
     state: SS = SS.INIT
     # When set, SS_Sample preserves a copy of the final proposal distribution before adding
     # Gumbel noise, for the lossless rejection-sampling verify in the generator
@@ -147,8 +148,11 @@ class SS_Sample_mn(SS_Sample):
     """
     def run(self, state: SamplingState):
         match state.state:
-            case SS.PROBS_N_S | SS.PROBS_N:
+            case SS.PROBS_N:
                 state.sample = torch.multinomial(state.probs, num_samples = 1)
+            case SS.PROBS_N_S:
+                temp = torch.multinomial(state.probs, num_samples = 1)
+                state.sample = state.indices.gather(-1, temp)
             case _:
                 raise ValueError("Sampling logic error")
         state.state = SS.DONE
@@ -177,8 +181,17 @@ class SS_Fused(SS_Base):
     keeps a top segment of the same ordering. The threshold is found from a deterministic
     fixed-point histogram of the logits (counts for top-K, exp-mass for top-P, normalized over
     the top-K-truncated set), with boundary buckets refined to 1/32768 nat -- finer than fp16
-    ULP, so the kept set matches the exact sort-based truncation for fp16 logits. Tokens tied
-    exactly at a cutoff are all kept rather than truncated in sort order.
+    ULP, so the kept set matches the exact sort-based truncation for fp16 logits, except at ties
+    and in the far tail:
+
+    - top-K: tokens tied exactly at the cutoff are all kept rather than truncated in sort order.
+      Tokens 32 nats or more below the max (at the filter temperature, relative weight below
+      e^-32) are not ordered: when the cutoff falls among them they are dropped, so fewer than
+      top_k tokens remain.
+    - top-P: the token crossing the cumulative mass is included. When it is tied with other
+      tokens, all of the ties stay eligible but are down-weighted together to the number of them
+      the sort-order cumulative sum would pass through, so the sample picks uniformly among them
+      instead of in sort order.
 
     Produced by CustomSampler's stack collapse; equivalent to the steps it replaces (same
     Gumbel noise stream for a given rand_u32, up to rounding at exact ties).
@@ -460,8 +473,8 @@ class SS_TopK(SS_Base):
 
 class SS_TopP(SS_Base):
     """
-    Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remaining tokens
+    Identify the smallest set of top tokens with a cumulative probability of at least P (the token whose
+    probability crosses P is included), mask out all remaining tokens
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
@@ -470,8 +483,9 @@ class SS_TopP(SS_Base):
     def run(self, state: SamplingState):
         match state.state:
             case SS.PROBS_N_S:
+                # Keep each token whose preceding mass is still short of P
                 cumsum = state.probs.cumsum(dim = -1)
-                mask = cumsum <= self.top_p
+                mask = (cumsum - state.probs) < self.top_p
                 state.probs[..., 1:] *= mask[..., 1:]
                 state.state = SS.PROBS_S
             case _:
@@ -867,6 +881,190 @@ class SS_PresFreqP(SS_Base):
         return True
 
 
+@lru_cache(64)
+def dry_sequence_breaker_tokens(
+    tokenizer: Tokenizer,
+    sequence_breakers: tuple[str, ...]
+) -> frozenset[int]:
+    """
+    Resolve sequence breaker strings for SS_DRY to token IDs, being every token whose piece
+    contains one of the strings. llama.cpp resolves breaker strings the same way for its
+    single-token breakers (get_overlapping_token_sequences); the multi-token restart sequences
+    it additionally builds from partially overlapping tokens are not supported here.
+    """
+    pieces = tokenizer.get_id_to_piece_list(include_special_tokens = True)
+    return frozenset(
+        t for t, piece in enumerate(pieces) if any(s in piece for s in sequence_breakers)
+    )
+
+
+@lru_cache(10)
+def dry_default_sequence_breaker_tokens(tokenizer: Tokenizer) -> frozenset[int]:
+    """
+    Default set of sequence breaker token IDs for SS_DRY, being every piece containing one of
+    the characters .,!?<>[](){}\\n\\t" plus every extended token. Matches
+    ExLlamaV2Sampler.get_dry_default_sequence_breaker_tokens in exllamav2.
+    """
+    breakers = dry_sequence_breaker_tokens(tokenizer, tuple('.,!?<>[](){}\n\t"'))
+    return frozenset(breakers | set(tokenizer.extended_id_to_piece.keys()))
+
+
+# llama.cpp equivalent FLOAT_MAX_LOG: ln of the largest float32
+_DRY_FLOAT_MAX_LOG = 88.7228391
+
+# Matches at or beyond the exponent clamp all produce the same penalty, so the match scan stops
+# there. _DRY_MATCH_CAP bounds the scan where the clamp cannot (dry_base near 1)
+_DRY_MATCH_CAP = 2048
+
+
+@lru_cache(10)
+def _dry_default_breaker_mask(tokenizer: Tokenizer) -> TokenMask | None:
+    """
+    Default breaker set for a tokenizer as a shared TokenMask, so samplers built without
+    explicit breakers resolve them per tokenizer at sampling time.
+    """
+    ids = dry_default_sequence_breaker_tokens(tokenizer)
+    return TokenMask(ids) if ids else None
+
+
+def _dry_max_exponent(base: float) -> int:
+    """
+    llama.cpp's exponent clamp: FLOAT_MAX_LOG / log(dry_base) computed entirely in float32,
+    truncated to int, with 0 (no clamp) for bases too close to 1. The float32 arithmetic decides
+    which side of the truncation the quotient lands on: base = 2.0 gives exactly 128 in float32
+    where float64 gives 127.99999998 -> 127.
+    """
+    base_f = torch.tensor(base, dtype = torch.float)
+    if not (base_f > torch.tensor(1.000001, dtype = torch.float)).item():
+        return 0
+    return int(torch.tensor(_DRY_FLOAT_MAX_LOG, dtype = torch.float) / base_f.log())
+
+
+class SS_DRY(SS_Base):
+    """
+    Apply the DRY (Don't Repeat Yourself) repetition penalty based on past token IDs. Must be one
+    of the first steps in the sampler chain, before the logits are transformed.
+
+    A token that would extend a sequence already seen in the context is penalized by
+    multiplier * base ** (match_length - allowed_length), subtracted from its logit, where
+    match_length is the length of the longest context suffix whose earlier repetition the token
+    would continue. The matching semantics and the float32 exponent clamp follow llama.cpp's
+    llama_sampler_dry_apply (ported to koboldcpp-derived runtimes by pi6am; the scheme was
+    designed by p-e-w), with two divergences:
+
+    - sequence breakers are single tokens, where llama.cpp additionally builds multi-token
+      restart sequences from partially overlapping tokens;
+    - the match scan stops where the penalty stops changing, at allowed_length plus llama.cpp's
+      exponent clamp. For dry_base so close to 1 that llama.cpp applies no clamp (at most
+      1.000001) it stops at 2048 tokens instead, so a longer verbatim repeat is penalized as a
+      2048-token one; at those bases the penalty grows by at most 0.2% per further 2048 tokens.
+
+    The parameter surface follows exllamav2, including dry_range = 0 meaning the whole context.
+    exllamav2's own DRY is a different algorithm (an occurrence-counting trie), so outputs are not
+    expected to match it.
+
+    One kernel launch per sampled token (ext.dry_penalty) on the logits device; past_ids are
+    uploaded first if they live on the host. The scan is O(window) comparisons per token for
+    ordinary text and at most O(window * min(window, scan limit)) for a context that is one long
+    verbatim repeat, where the scan limit is allowed_length plus the clamp (2048 without one).
+    """
+    def __init__(
+        self,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 1.75,
+        dry_allowed_length: int = 2,
+        dry_range: int = 0,
+        dry_sequence_breakers: frozenset[int] | set[int] | list[int] | None = None,
+        tokenizer: Tokenizer | None = None,
+    ):
+        """
+        :param dry_multiplier:
+            Scale of the penalty. 0.0 disables the step. Negative values are not accepted (they
+            would reward repetition)
+        :param dry_base:
+            Base of the exponential penalty growth per token of match length. Values below 1.0
+            disable the step, matching llama.cpp
+        :param dry_allowed_length:
+            Longest repeated sequence that goes unpenalized; a token extending a repeat beyond
+            this length is penalized
+        :param dry_range:
+            Number of most recent past tokens to consider. 0 or negative considers the whole
+            context, following the exllamav2 convention for this parameter
+        :param dry_sequence_breakers:
+            Token IDs that repeated sequences cannot span, so that e.g. punctuation or chat
+            template markers do not count as repetition. Breaker tokens are never penalized.
+            None derives the default set via dry_default_sequence_breaker_tokens, from the
+            tokenizer given here or from the one passed to forward() at sampling time (the
+            generator passes its tokenizer); pass an empty set to disable breakers. Custom
+            breaker strings resolve to IDs via dry_sequence_breaker_tokens
+        :param tokenizer:
+            Used to derive the default breaker set when dry_sequence_breakers is None. Ignored
+            if dry_sequence_breakers is given
+        """
+        assert dry_multiplier >= 0.0, "dry_multiplier must be non-negative"
+        assert isinstance(dry_allowed_length, int) or dry_allowed_length.is_integer(), \
+            "dry_allowed_length must be integer"
+        assert dry_allowed_length >= 0, "dry_allowed_length must be non-negative"
+        assert isinstance(dry_range, int) or dry_range.is_integer(), "dry_range must be integer"
+        # With no explicit breakers and no tokenizer bound here, the default set is resolved
+        # per tokenizer at sampling time instead
+        self.default_breakers = dry_sequence_breakers is None and tokenizer is None
+        if dry_sequence_breakers is None and tokenizer is not None:
+            dry_sequence_breakers = dry_default_sequence_breaker_tokens(tokenizer)
+        # llama.cpp stores dry_multiplier and dry_base as float32 and computes the penalty from
+        # the rounded values; round here so identical settings give identical penalties
+        self.dry_multiplier = float(torch.tensor(dry_multiplier, dtype = torch.float))
+        self.dry_base = float(torch.tensor(dry_base, dtype = torch.float))
+        self.dry_allowed_length = int(dry_allowed_length)
+        self.dry_range = int(dry_range)
+        self.max_exponent = _dry_max_exponent(self.dry_base)
+        self.breakers = TokenMask(dry_sequence_breakers) if dry_sequence_breakers else None
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                in_logits = state.in_logits
+                state.logits = torch.empty_like(in_logits, dtype = torch.float)
+            case SS.LOGITS:
+                in_logits = state.logits
+            case _:
+                raise ValueError("Sampling logic error")
+        breakers = self.breakers
+        if self.default_breakers and state.tokenizer is not None:
+            breakers = _dry_default_breaker_mask(state.tokenizer)
+        assert state.past_ids is not None, "SS_DRY requires past token IDs"
+        assert state.past_ids.shape[0] == state.bsz
+        device = in_logits.device
+        past_ids = state.past_ids
+        if past_ids.device != device:
+            past_ids = past_ids.to(device, non_blocking = past_ids.is_pinned())
+        n_ws = state.bsz * state.dim
+        scratch = torch.full((n_ws + state.bsz,), -1, dtype = torch.int32, device = device)
+        ext.dry_penalty(
+            in_logits,
+            state.logits,
+            past_ids.contiguous(),
+            breakers.get(state.dim, device) if breakers is not None else None,
+            scratch[:n_ws],
+            scratch[n_ws:],
+            self.dry_multiplier,
+            self.dry_base,
+            self.dry_allowed_length,
+            self.dry_range,
+            self.max_exponent,
+            _DRY_MATCH_CAP,
+        )
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if self.dry_multiplier == 0.0 or self.dry_base < 1.0:
+            return SS_NoOp()
+        return None
+
+    def reqs_past_ids(self):
+        return True
+
+
 class SS_AdaptiveP(SS_Base):
     """
     Implements Adaptive-P sampler. Maintains state but does not remember past states (keeps future state in case
@@ -914,7 +1112,7 @@ class SS_AdaptiveP(SS_Base):
 
                 temp = torch.argmax(state.logits, dim = -1)
                 state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
-                sampled_prob = state.probs[0, temp].item()
+                sampled_prob = state.probs[buffered_arange(state.bsz, state.in_logits.device), temp]   # per row; see log below
 
                 # self.log.append((adapted_target, sampled_prob))
                 # if len(self.log) == 300:
@@ -959,19 +1157,25 @@ class CustomSampler(Sampler):
         # path.
         simplified = []
         for step in steps:
-            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
-            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
             alt = step.alt()
             if alt:
                 step = alt
-            if not isinstance(step, SS_NoOp):
-                simplified.append(step)
+            if isinstance(step, SS_NoOp):
+                # A step is only replaced by SS_NoOp when it is a mathematical identity
+                # (temperature 1.0, top_k < 1, top_p 1.0, min_p 0, rep_p 1.0, empty mask...),
+                # so it can neither need the past ids nor a torch seed. Reading the flags off
+                # the *original* step would otherwise keep reqs_past_ids True for the default
+                # TabbyAPI sampler stack, costing a full-context H2D upload per token.
+                continue
+            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
+            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
+            simplified.append(step)
 
         head = []
         fused_tail = None
         if fused_sampler_enable:
             i = 0
-            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens, SS_LogitBias):
+            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_DRY, SS_BanTokens, SS_LogitBias):
                 i += 1
             fused_tail = _match_fused_tail(simplified[i:])
             if fused_tail is not None:
@@ -1109,6 +1313,7 @@ class CustomSampler(Sampler):
             bsz = bsz,
             in_logits = logits.view(bsz, dim),
             past_ids = sequence_ids,
+            tokenizer = tokenizer,
             fused_mask = fused_mask,
             fused_dim = fused_dim,
             keep_probs = keep_probs,

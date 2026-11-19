@@ -18,6 +18,8 @@ class PromptFormat:
     def harmony_tags(self):
         # None: Streamer_harmony keeps its GPT-OSS default tags
         return None
+    def inject_thinktag(self):
+        return True
 
 
 class PromptFormat_raw(PromptFormat):
@@ -123,6 +125,50 @@ class PromptFormat_chatml(PromptFormat):
         ]
 
 
+class PromptFormat_mimo(PromptFormat):
+    description = "MiMo (ChatML variant)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        # MiMo quirk: no newline after <|im_end|>
+        context = ""
+        if system_prompt:
+            context += f"<|im_start|>system\n{system_prompt}<|im_end|>"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>"
+            context += f"<|im_start|>assistant\n"
+            if a is None and not think:
+                # Closed think tags to disable thinking
+                context += "<think></think>"
+            if a is not None: context += f"{a}<|im_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        # Also no newline after <think>
+        return "<think>", "</think>"
+
+    def inject_thinktag(self):
+        # Model decides in reasoning mode
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+
 class PromptFormat_qwen35(PromptFormat):
     description = "Qwen3.5 format, reasoning-aware ChatML"
 
@@ -203,7 +249,7 @@ class PromptFormat_glm(PromptFormat):
         context = f"[gMASK]<sop><|system|>\n{system_prompt}"
         for (u, a) in messages:
             context += f"<|user|>\n{u}"
-            context += f"<|assistant|>"
+            context += f"<|assistant|>\n"
             if a is not None: context += f"{a}"
         return context
 
@@ -1035,25 +1081,74 @@ class PromptFormat_ds4(PromptFormat):
     def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
-            context += f"<｜begin▁of▁sentence｜>{system_prompt}"
+            context += f"<｜begin▁of▁sentence｜>{system_prompt}\n\n"
         for (u, a) in messages:
             context += f"<｜User｜>{u}"
             context += f"<｜Assistant｜>"
-            context += f"<think>" if think else f"</think>"
             if a is not None:
-                context += f"{a}"
+                if "</think>" in a:
+                    a = a.split("</think>", 1)[1].lstrip("\n")
+                context += f"</think>{a}"
                 context += f"<｜end▁of▁sentence｜>"
+            else:
+                context += f"" if think else f"</think>"
         return context
 
     def add_bos(self):
         return False
 
     def thinktag(self):
-        return "<think>\n", "</think>"
+        return "<think>", "</think>"
 
     def stop_conditions(self, tokenizer):
         return tokenizer.config.eos_token_id_list + [
             tokenizer.single_id("<｜User｜>")
+        ]
+
+
+class PromptFormat_spark(PromptFormat):
+    description = "Spark-X2.5"
+
+    DEFAULT_SYSTEM = "you are a helpful assistant."
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return self.DEFAULT_SYSTEM
+
+    def format(self, system_prompt, messages, think):
+        # chat_template.jinja: each message is <｜start▁of▁sentence｜><|Role|>...<｜end▁of▁sentence｜>
+        # with ASCII-bar role tokens. The system block always carries the template's default
+        # line; a custom system prompt is appended after a blank line. Completed assistant
+        # turns render as a closed think block plus the answer (earlier reasoning dropped);
+        # the open turn gets </think> in plain mode, and in reasoning mode chat.py appends the
+        # <think> opener itself (thinktag)
+        bos, eos = "<｜start▁of▁sentence｜>", "<｜end▁of▁sentence｜>"
+        system = self.DEFAULT_SYSTEM
+        if system_prompt and system_prompt.strip() != self.DEFAULT_SYSTEM:
+            system += "\n\n" + system_prompt.strip()
+        context = f"{bos}<|System|>\n{system}{eos}"
+        for (u, a) in messages:
+            context += f"{bos}<|User|>{u}{eos}"
+            context += f"{bos}<|Bot|>"
+            if a is not None:
+                if "</think>" in a:
+                    a = a.split("</think>", 1)[1].lstrip("\n")
+                context += f"</think>{a}{eos}"
+            elif not think:
+                context += "</think>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<｜start▁of▁sentence｜>")
         ]
 
 
@@ -1121,6 +1216,46 @@ class PromptFormat_muse(PromptFormat):
         }
 
 
+class PromptFormat_ling(PromptFormat):
+    description = "Ling 3.x (Bailing V3) format: <role>...</role> turns, 'detailed thinking' switch in the system turn"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        # The bundled template renders the system turn with a 'detailed thinking on/off' line, HUMAN and
+        # ASSISTANT turns closed by <|role_end|>, earlier assistant turns with an empty think block (their
+        # reasoning is not preserved), and the generation prompt opening a think block only when thinking is on
+        context = f"<role>SYSTEM</role>{system_prompt}\ndetailed thinking {'on' if think else 'off'}<|role_end|>"
+        for (u, a) in messages:
+            context += f"<role>HUMAN</role>{u}<|role_end|>"
+            context += f"<role>ASSISTANT</role>\n"
+            if a is not None:
+                context += f"<think></think>{a}<|role_end|>"
+            elif not think:
+                context += f"<think></think>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|role_end|>"),
+            tokenizer.single_id("<role>"),
+            """<|role_end|>""",
+        ]
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -1148,5 +1283,8 @@ prompt_formats = {
     "kimi": PromptFormat_kimi,
     "deepseek": PromptFormat_deepseek,
     "ds4": PromptFormat_ds4,
+    "spark": PromptFormat_spark,
     "muse": PromptFormat_muse,
+    "mimo": PromptFormat_mimo,
+    "ling": PromptFormat_ling,
 }

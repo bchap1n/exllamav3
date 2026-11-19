@@ -1,14 +1,8 @@
 *.egg-info/
 build/
-
-*.pyc
 __pycache__/
-.idea
-venv
-dist
+*.pyd
 
-# produced by `pip install -e .`
-exllamav3_ext.cpython-*.so
 # large local assets (model weights, reference clones, parity fixtures)
 .venv/
 reference/
@@ -18,3 +12,11 @@ hf-release/
 
 # job ledger written by quantize/conversion tooling
 jobs.jsonl
+
+# written next to the sources by torch's hipify during ROCm builds
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/*_hip.*
+exllamav3/exllamav3_ext/**/hip_*
+
+# per-machine test model registry overrides (tests/testlib/models.py)
+tests/models.local.yaml

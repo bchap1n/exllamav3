@@ -12,6 +12,7 @@ from ..cache.recurrent import (
     mp_cache_recurrent_unstash,
     mp_cache_recurrent_clear,
     new_checkpoint_handle,
+    host_copy,
 )
 
 
@@ -81,14 +82,21 @@ class ShortConvState:
         return 0
 
 
-    def stash(self):
-        stashed = {
+    def stash_header(self):
+        return {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
+
+
+    def stash_layers(self, layers: dict):
+        return {k: l.stash(self.slot) for k, l in layers.items()}
+
+
+    def stash(self):
+        stashed = self.stash_header()
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot)
+            stashed.update(self.stash_layers(self.cache.get_all_recurrent_layers()))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
@@ -173,7 +181,10 @@ class ShortConvLayerState:
 
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
-        assert num_tokens <= last_history
+        # Without recorded history nothing was provisional: the rewind is a position correction
+        # on the state object only (see GDNState.rewind)
+        assert num_tokens >= 0 and (last_history == 0 or num_tokens <= last_history), \
+            f"short-conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
         cdim = self.module.conv_kernel_size
         if last_history > 0:
             c_state = self.conv_state[slot, :, :cdim]
@@ -185,7 +196,7 @@ class ShortConvLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
-        return self.conv_state[slot, :, :cdim].cpu()
+        return host_copy(self.conv_state[slot, :, :cdim])
 
 
     def unstash(self, slot, stashed, position: int = 0):

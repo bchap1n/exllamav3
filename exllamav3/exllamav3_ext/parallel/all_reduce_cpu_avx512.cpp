@@ -1,9 +1,5 @@
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
-#else
-#include <atomic>
-#include <cstring>
-#endif
 #include "all_reduce_cpu_avx512.h"
 #include "all_reduce_cpu_avx2.h"
 #include "../avx512_target.h"
@@ -12,20 +8,6 @@
 #ifndef __linux__
 #include <intrin.h>
 #endif
-
-// Portable equivalent of _mm_pause() (aarch64 "yield" hint)
-static inline void cpu_pause()
-{
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-    _mm_pause();
-#elif defined(__aarch64__)
-    __asm__ __volatile__("yield" ::: "memory");
-#else
-    __asm__ __volatile__("" ::: "memory");
-#endif
-}
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 
 // Add 32 BF16 values from A and B, store to A.
 // Uses vpmovdw (AVX-512BW) to avoid packus + lane-fix permute.
@@ -94,84 +76,6 @@ static inline void do32_avx512_fused(uint16_t* __restrict dst,
     _mm512_storeu_si512((__m512i*)dst, result);
 }
 
-#else
-
-// Scalar bit-exact mirror of the AVX-512 BF16 adds (aarch64 etc.)
-static inline void do32_avx512(uint16_t* __restrict ap, const uint16_t* __restrict bp)
-{
-    for (int j = 0; j < 32; ++j)
-    {
-        uint32_t s = (((uint32_t) ap[j]) << 16) + (((uint32_t) bp[j]) << 16);
-        ap[j] = (uint16_t) ((s + 0x8000u) >> 16);
-    }
-}
-
-static inline void do32_avx512_fused(uint16_t* __restrict dst,
-                                     const uint16_t* __restrict src_a,
-                                     const uint16_t* __restrict src_b)
-{
-    for (int j = 0; j < 32; ++j)
-    {
-        uint32_t s = (((uint32_t) src_a[j]) << 16) + (((uint32_t) src_b[j]) << 16);
-        dst[j] = (uint16_t) ((s + 0x8000u) >> 16);
-    }
-}
-
-static inline float bf16_raw_to_float(uint16_t h)
-{
-    uint32_t f = (uint32_t) h << 16;
-    float out;
-    std::memcpy(&out, &f, 4);
-    return out;
-}
-
-static inline uint16_t float_to_fp16_rne(float f)
-{
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t e = (int32_t) ((x >> 23) & 0xff) - 127;
-    uint32_t m = x & 0x7fffffu;
-    if (e > 15)
-        return (uint16_t) (sign | 0x7c00u);   // overflow -> inf
-    if (e >= -14)
-    {
-        uint32_t men = (m + 0x1000u + ((m >> 13) & 1)) >> 13;  // RNE to 10 mantissa bits
-        if (men & 0x400u) { men >>= 1; e++; }
-        if (e > 15) return (uint16_t) (sign | 0x7c00u);
-        return (uint16_t) (sign | ((uint32_t) (e + 15) << 10) | (men & 0x3ffu));
-    }
-    uint32_t shift = (uint32_t) (-e - 14);
-    uint32_t mm = m | 0x800000u;
-    uint32_t s = mm >> shift;
-    uint32_t rem = mm & ((1u << shift) - 1);
-    uint32_t halfway = 1u << (shift - 1);
-    if (rem > halfway || (rem == halfway && (s & 1))) s++;
-    return (uint16_t) (sign | s);
-}
-
-static inline void do32_fp16_avx512(uint16_t* __restrict ap, const uint16_t* __restrict bp)
-{
-    for (int j = 0; j < 32; ++j)
-    {
-        float s = bf16_raw_to_float(ap[j]) + bf16_raw_to_float(bp[j]);
-        ap[j] = float_to_fp16_rne(s);
-    }
-}
-
-static inline void do32_fp16_avx512_fused(uint16_t* __restrict dst,
-                                          const uint16_t* __restrict src_a,
-                                          const uint16_t* __restrict src_b)
-{
-    for (int j = 0; j < 32; ++j)
-    {
-        float s = bf16_raw_to_float(src_a[j]) + bf16_raw_to_float(src_b[j]);
-        dst[j] = float_to_fp16_rne(s);
-    }
-}
-
-#endif
-
 // A += B (BF16), in-place, round-toward-zero.
 // Unrolled 4x (128 BF16 values = 256 bytes per iteration) with deep prefetch.
 // Uses regular stores since dst may be re-read by subsequent device accumulations.
@@ -186,7 +90,6 @@ void bf16_add_inplace_avx512
 {
     size_t i = 0;
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     // Main loop: 128 BF16 values per iteration (4 x do32)
     for (; i + 128 <= count; i += 128)
     {
@@ -208,13 +111,6 @@ void bf16_add_inplace_avx512
         do32_avx512(a + i,      b + i);
         do32_avx512(a + i + 32, b + i + 32);
     }
-#else
-    for (; i < count; i += 64)
-    {
-        do32_avx512(a + i,      b + i);
-        do32_avx512(a + i + 32, b + i + 32);
-    }
-#endif
 }
 
 // dst = src_a + src_b (BF16), fused two-source add.
@@ -231,7 +127,6 @@ void bf16_add_twosrc_avx512
 {
     size_t i = 0;
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     for (; i + 128 <= count; i += 128)
     {
         _mm_prefetch((const char*)(src_a + i + 128), _MM_HINT_T0);
@@ -250,16 +145,7 @@ void bf16_add_twosrc_avx512
         do32_avx512_fused(dst + i,      src_a + i,      src_b + i);
         do32_avx512_fused(dst + i + 32, src_a + i + 32, src_b + i + 32);
     }
-#else
-    for (; i < count; i += 64)
-    {
-        do32_avx512_fused(dst + i,      src_a + i,      src_b + i);
-        do32_avx512_fused(dst + i + 32, src_a + i + 32, src_b + i + 32);
-    }
-#endif
 }
-
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 
 // FP16 wire versions: hardware widen/narrow (EVEX vcvtph2ps/vcvtps2ph, AVX512F), FP32 add,
 // round-to-nearest-even. Convert-port bound (~2x the bf16 integer path per add) but exact wire
@@ -299,8 +185,6 @@ static inline void do32_fp16_avx512_fused(uint16_t* __restrict dst,
     _mm512_storeu_si512((__m512i*)dst, result);
 }
 
-#endif
-
 // A += B (FP16), in-place. Assumes count % 64 == 0.
 AVX512_TARGET
 void fp16_add_inplace_avx512
@@ -311,7 +195,6 @@ void fp16_add_inplace_avx512
 )
 {
     size_t i = 0;
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     for (; i + 128 <= count; i += 128)
     {
         _mm_prefetch((const char*)(a + i + 128), _MM_HINT_T0);
@@ -328,13 +211,6 @@ void fp16_add_inplace_avx512
         do32_fp16_avx512(a + i,      b + i);
         do32_fp16_avx512(a + i + 32, b + i + 32);
     }
-#else
-    for (; i < count; i += 64)
-    {
-        do32_fp16_avx512(a + i,      b + i);
-        do32_fp16_avx512(a + i + 32, b + i + 32);
-    }
-#endif
 }
 
 // dst = src_a + src_b (FP16), fused two-source add. Assumes count % 64 == 0.
@@ -348,7 +224,6 @@ void fp16_add_twosrc_avx512
 )
 {
     size_t i = 0;
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     for (; i + 128 <= count; i += 128)
     {
         _mm_prefetch((const char*)(src_a + i + 128), _MM_HINT_T0);
@@ -365,29 +240,15 @@ void fp16_add_twosrc_avx512
         do32_fp16_avx512_fused(dst + i,      src_a + i,      src_b + i);
         do32_fp16_avx512_fused(dst + i + 32, src_a + i + 32, src_b + i + 32);
     }
-#else
-    for (; i < count; i += 64)
-    {
-        do32_fp16_avx512_fused(dst + i,      src_a + i,      src_b + i);
-        do32_fp16_avx512_fused(dst + i + 32, src_a + i + 32, src_b + i + 32);
-    }
-#endif
 }
 
 // Fast path enable for AVX-512
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 AVX512_TARGET
 void enable_fast_fp_avx512()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 }
-#else
-void enable_fast_fp_avx512()
-{
-    // No MXCSR on aarch64; nothing to do
-}
-#endif
 
 // Perform reduction using AVX-512 - original MAX_DEVICES-based indexing
 AVX512_TARGET
@@ -454,7 +315,7 @@ void perform_cpu_reduce_avx512
             int throttle_spin = 0;
             while (!cpusum_recv_ready(ctx, device_mask, recv_target))
             {
-                cpu_pause();
+                _mm_pause();
                 if (++throttle_spin > 10000)
                 {
                     throttle_spin = 0;
@@ -528,7 +389,7 @@ void perform_cpu_reduce_avx512
             if (!rem_devices)
                 break;
 
-            cpu_pause();
+            _mm_pause();
 
             timeout_spin++;
             if (timeout_spin > 10000)
@@ -544,8 +405,13 @@ void perform_cpu_reduce_avx512
             }
         }
 
-        // Handle case where only one device contributed (no add needed, just copy)
-        if (first_src != nullptr && first_src != host_ptr(MAX_DEVICES, stage))
+        // No device contributed: the sum is zero (the slot still holds an earlier stage's result)
+        if (first_src == nullptr)
+        {
+            memset(host_ptr(MAX_DEVICES, stage), 0, stage_size);
+        }
+        // Only one device contributed (no add needed, just copy)
+        else if (first_src != host_ptr(MAX_DEVICES, stage))
         {
             memcpy(host_ptr(MAX_DEVICES, stage), first_src, stage_size);
         }
@@ -558,3 +424,5 @@ void perform_cpu_reduce_avx512
         chunk_idx++;
     }
 }
+
+#endif  // EXL3_AARCH64_STUB

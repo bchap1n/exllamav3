@@ -10,6 +10,7 @@
 #include "../rope.cuh"
 #include "../quant/exl3_gemm.cuh"
 #include "../dsv4_compress.cuh"
+#include "../dsv4_pool_quant.cuh"
 #include "../dsa_topk.cuh"
 #include "../graph.cuh"
 
@@ -119,12 +120,24 @@ void BC_DSV4Attention::run_gr
         c10::optional<at::Tensor> no_pid = {};
         c10::optional<at::Tensor> qn = q_ones;
         c10::optional<at::Tensor> kn = kv_norm_w;
-        rope_gr
-        (
-            q4, q4, k_in, k_out, inv_freq, 0, positions, no_pid,
-            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0, false,
-            1, D - rope_dim, graph
-        );
+        if (q_ones.numel() == 0)
+        {
+            // No per-head q norm (V4.1): the q rope slice rotates on its own, kv takes its norm in the
+            // kernel's q slot (it only normalizes k alongside a normalized q)
+            at::Tensor q_sl = q4.narrow(3, D - rope_dim, rope_dim);
+            c10::optional<at::Tensor> none = {};
+            rope_gr(q_sl, q_sl, none, none, inv_freq, 0, positions, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, none, none, 1e-6f, 0.0f, 0.0f, 0, false, 1, 0, graph);
+            rope_gr(kv4, kv4, none, none, inv_freq, 0, positions, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, kn, none, rms_norm_eps, 0.0f, 0.0f, 0, false, 1, D - rope_dim, graph);
+        }
+        else
+            rope_gr
+            (
+                q4, q4, k_in, k_out, inv_freq, 0, positions, no_pid,
+                ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
+                false, 1, D - rope_dim, graph
+            );
     }
 
     // Compressors: emitted entries into the paged pools via the per-job block table
@@ -136,8 +149,21 @@ void BC_DSV4Attention::run_gr
         at::Tensor bkv = comp_buf_kv.value(), bg = comp_buf_gate.value();
         at::Tensor pc = pool_c.value(), pr = pool_r.value();
         c10::optional<at::Tensor> pr_opt = pr;
-        comp_bc->run_gr(x_rows, bkv, bg, comp_ovl, pc, pr_opt, pos, pt, s.mgc_comp, graph,
-                        use_fan, bt, pool_epp);
+        if (pool_bits)
+        {
+            // Packed pool: compress into this step's staging rows, then quantize + scatter
+            // through the block table (both position-driven from pos_dev, graph-safe)
+            at::Tensor st = pool_stage.value();
+            at::Tensor ps = pool_s.value();
+            c10::optional<at::Tensor> no_b = {};
+            c10::optional<at::Tensor> no_bt = {};
+            comp_bc->run_gr(x_rows, bkv, bg, comp_ovl, st, no_b, pos, pt, s.mgc_comp, graph,
+                            use_fan, no_bt, 0, true);
+            dsv4_pool_quant_scatter_gr(st, pc, ps, pr, pool_bt, pos, pt, m, seq, pool_epp, graph);
+        }
+        else
+            comp_bc->run_gr(x_rows, bkv, bg, comp_ovl, pc, pr_opt, pos, pt, s.mgc_comp, graph,
+                            use_fan, bt, pool_epp);
         if (idx_bc)
         {
             at::Tensor ikv = idx_buf_kv.value(), ig = idx_buf_gate.value();
@@ -229,6 +255,8 @@ void BC_DSV4Attention::run_gr
             (void*) (uintptr_t) (uint32_t) win_beg,
             (void*) (uintptr_t) (uint32_t) 0,   // slot_ids (MULTIROW only)
             (void*) (uintptr_t) (uint32_t) 0,   // ring_stride (MULTIROW only)
+            (void*) (pool_bits ? pool_s.value().data_ptr() : sinks.data_ptr()),           // pool_s (QC only)
+            (void*) (pool_bits ? h32.value().data_ptr() : sinks.data_ptr()),           // h32 (QC only)
         };
         s.k_split->launch(seq * hb, n_splits, 1, args, stream);
         if (graph)
@@ -251,6 +279,7 @@ void BC_DSV4Attention::run_gr
             (void*) (uintptr_t) (uint32_t) pos,
             (void*) (uintptr_t) (uint32_t) seq,
             (void*) (uintptr_t) (uint32_t) n_splits,
+            (void*) (pool_bits ? h32.value().data_ptr() : sinks.data_ptr()),                       // h32 (QC only)
         };
         s.k_combine->launch(seq * hb, CEIL_DIVIDE(D, 128), 1, args, stream);
         if (graph)
@@ -413,12 +442,23 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
         c10::optional<at::Tensor> no_pid = {};
         c10::optional<at::Tensor> qn = q_ones;
         c10::optional<at::Tensor> kn = kv_norm_w;
-        rope_gr
-        (
-            q4, q4, k_in, k_out, inv_freq, 0, pos_opt, no_pid,
-            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0, false,
-            1, D - rope_dim, graph
-        );
+        if (q_ones.numel() == 0)
+        {
+            // No per-head q norm (V4.1), see BC_DSV4Attention::run_gr
+            at::Tensor q_sl = q4.narrow(3, D - rope_dim, rope_dim);
+            c10::optional<at::Tensor> none = {};
+            rope_gr(q_sl, q_sl, none, none, inv_freq, 0, pos_opt, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, none, none, 1e-6f, 0.0f, 0.0f, 0, false, 1, 0, graph);
+            rope_gr(kv4, kv4, none, none, inv_freq, 0, pos_opt, no_pid,
+                    ROPESTYLE_GPTJ, 1.0f, kn, none, rms_norm_eps, 0.0f, 0.0f, 0, false, 1, D - rope_dim, graph);
+        }
+        else
+            rope_gr
+            (
+                q4, q4, k_in, k_out, inv_freq, 0, pos_opt, no_pid,
+                ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
+                false, 1, D - rope_dim, graph
+            );
     }
 
     // Compressors on the fan outputs: grid.y-batched, entries written to the paged pools
@@ -429,10 +469,26 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
         at::Tensor pc = pool_c.value();
         c10::optional<at::Tensor> pr_opt = pool_r.value();
         c10::optional<at::Tensor> bt = bt_st.narrow(0, 0, B);
-        dsv4_compress_gr(s.mgc_comp.value().select(0, 0), s.mgc_comp.value().select(0, 1),
-                         bkv, bg, comp_ovl, comp_ape.value(), comp_norm_w.value(), comp_eps,
-                         comp_inv_freq.value(), pc, pr_opt, 0, pos_opt, m, graph,
-                         slot_opt, bt, pool_epp);
+        if (pool_bits)
+        {
+            // Packed pool: per-job staging rows (job-indexed, not slot-indexed), then
+            // quantize + scatter through each job's block-table row
+            at::Tensor st = pool_stage.value().narrow(0, 0, B);
+            at::Tensor ps = pool_s.value();
+            at::Tensor pr = pool_r.value();
+            c10::optional<at::Tensor> no_b = {};
+            c10::optional<at::Tensor> no_bt = {};
+            dsv4_compress_gr(s.mgc_comp.value().select(0, 0), s.mgc_comp.value().select(0, 1),
+                             bkv, bg, comp_ovl, comp_ape.value(), comp_norm_w.value(), comp_eps,
+                             comp_inv_freq.value(), st, no_b, 0, pos_opt, m, graph,
+                             slot_opt, no_bt, 0, true);
+            dsv4_pool_quant_scatter_gr(st, pc, ps, pr, bt.value(), 0, pos_opt, m, S, pool_epp, graph);
+        }
+        else
+            dsv4_compress_gr(s.mgc_comp.value().select(0, 0), s.mgc_comp.value().select(0, 1),
+                             bkv, bg, comp_ovl, comp_ape.value(), comp_norm_w.value(), comp_eps,
+                             comp_inv_freq.value(), pc, pr_opt, 0, pos_opt, m, graph,
+                             slot_opt, bt, pool_epp);
         if (has_idx)
         {
             at::Tensor ikv = idx_buf_kv.value(), ig = idx_buf_gate.value();
@@ -512,6 +568,8 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
             (void*) a_beg.data_ptr(),                       // ring_beg (per job)
             (void*) arr.select(0, 4).data_ptr(),            // slot_ids
             (void*) (uintptr_t) (uint32_t) ((int) ring.size(1) * D),
+            (void*) (pool_bits ? pool_s.value().data_ptr() : sinks.data_ptr()),                       // pool_s (QC only)
+            (void*) (pool_bits ? h32.value().data_ptr() : sinks.data_ptr()),                       // h32 (QC only)
         };
         s.k_split->launch(R * hb, n_splits, 1, args, stream);
     }
@@ -526,6 +584,7 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
             (void*) a_pos.data_ptr(),                       // q_pos0 (per job)
             (void*) (uintptr_t) (uint32_t) R,
             (void*) (uintptr_t) (uint32_t) n_splits,
+            (void*) (pool_bits ? h32.value().data_ptr() : sinks.data_ptr()),                       // h32 (QC only)
         };
         s.k_combine->launch(R * hb, CEIL_DIVIDE(D, 128), 1, args, stream);
     }
@@ -577,9 +636,9 @@ at::Tensor BC_DSV4BatchAttention::run(const at::Tensor& x, int B, int S)
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(x, B, S, s, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
     }
 
     // Everything is device-driven; the input pointer is the only patched parameter
@@ -607,9 +666,9 @@ at::Tensor BC_DSV4Attention::run(const at::Tensor& x, int pos, int win_beg, int 
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(x, seq, regime, pos, win_beg, s, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
     }
 
     int ec = comp_bc ? (pos + seq) / m : 0;

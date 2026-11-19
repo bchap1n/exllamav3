@@ -95,7 +95,7 @@ def main(args):
     if args.cache_quant is not None:
         split = [int(bits) for bits in args.cache_quant.split(",")]
         if len(split) == 1:
-            sim_kvq = split + split
+            sim_kvq = tuple(split) + tuple(split)
         elif len(split) == 2:
             sim_kvq = tuple(split)
         else:
@@ -144,6 +144,14 @@ def main(args):
     save_logits_a = []
     save_logits_b = []
 
+    params_a = [{} for _ in range(len(states_a))]
+    params_b = [{} for _ in range(len(states_b))]
+
+    # Architecture-specific input preparation, as Model.forward does before the module chain:
+    # positions for attention, and e.g. the token ids DeepSeek-V4's hash-routed MoE layers need
+    for b in range(len(states_a)):
+        states_a[b] = model_a.prepare_inputs(states_a[b], params_a[b])
+        states_b[b] = model_b.prepare_inputs(states_b[b], params_b[b])
     # Inference
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
@@ -184,17 +192,19 @@ def main(args):
             state_b = states_b[b]
             eval_ids = all_eval_ids[b]
 
-            params_a = {"sim_kvq": sim_kvq}
-            state_a = module_a.prepare_for_device(state_a, params_a)
-            state_a = module_a.forward(state_a, params_a)
+            params_a[b].update({"sim_kvq": sim_kvq})
+            params_a[b]["dev_cache"] = None
+            # Modules may hand back a view of a shared g_tensor_cache workspace (e.g. the
+            # hyperconnection head's collapsed state): both models on one device would alias the
+            # same buffer and later transients would overwrite it, so the harness keeps its own copy
+            state_a = module_a.prepare_for_device(state_a, params_a[b])
+            state_a = module_a.forward(state_a, params_a[b]).clone()
 
-            params_b = {}
-            state_b = module_b.prepare_for_device(state_b, params_b)
-            state_b = module_b.forward(state_b, params_b)
+            params_b[b].update({})
+            params_b[b]["dev_cache"] = None
+            state_b = module_b.prepare_for_device(state_b, params_b[b])
+            state_b = module_b.forward(state_b, params_b[b]).clone()
 
-            # Optionally override model A state for first layers
-            if idx < args.keep_b:
-                state_a = state_b.clone()
 
             # Drop logits on last iteration
             if not logits_layer:
@@ -212,8 +222,10 @@ def main(args):
             if not logits_layer:
                 rows = state_a.shape[0]
                 for j in range(rows):
-                    sa = state_a[j].to(float)
-                    sb = state_b[j].to(float)
+                    # Hyperconnection models carry the residual as (seq, streams, hidden): compare
+                    # the streams flattened to rows, the Frobenius norm needs 2D
+                    sa = state_a[j].reshape(-1, state_a.shape[-1]).to(float)
+                    sb = state_b[j].reshape(-1, state_b.shape[-1]).to(float)
                     cos_error_sum += cosine_error(sa, sb)
                     sqnr_sum += sqnr(sa, sb)
                     sa -= sb
@@ -270,6 +282,11 @@ def main(args):
                         cf = logits_b2[cf_a:cf_a + 256, :kl_vocab_size].float()
                         conf_b_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
 
+            # keep_b: the error above is this module's own, both models fed the same (B) input;
+            # from here on A continues from B's state
+            if idx < args.keep_b and not logits_layer:
+                states_a[b] = state_b.clone()
+
         # Print error
         if not logits_layer:
             rfn_error = rfn_error_sum / args.rows
@@ -287,10 +304,10 @@ def main(args):
         if logits_layer:
             if args.save_logits_a:
                 print(f" -- Saving model A logits to: {args.save_logits_a}")
-                save_tensor(state_a, args.save_logits_a, "logits")
+                save_tensor(save_logits_a, args.save_logits_a, "logits")
             if args.save_logits_b:
                 print(f" -- Saving model B logits to: {args.save_logits_b}")
-                save_tensor(state_b, args.save_logits_b, "logits")
+                save_tensor(save_logits_b, args.save_logits_b, "logits")
 
         # Final ppl, kld
         if logits_layer:
@@ -457,7 +474,7 @@ if __name__ == "__main__":
     parser.add_argument("-mb", "--model_b", type = str, help = "Model B", required = True)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows, default: 100", default = 100)
     parser.add_argument("-l", "--length", type = int, help = "Tokens per row, default: 2048", default = 2048)
-    parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
+    parser.add_argument("-kb", "--keep_b", type = int, help = "Propagate B's state through the first N modules: each of them still reports its own A vs B error on the same input, isolating per-module error from accumulated drift", default = 0)
     parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
     parser.add_argument("-or", "--override", type = str, help = "Model A tensor override spec (YAML)", default = None)

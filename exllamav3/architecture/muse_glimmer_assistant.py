@@ -27,9 +27,8 @@ class MuseGlimmerAssistantConfig(DFlashConfig):
             model_classes = {"text": MuseGlimmerAssistantModel},
             **kwargs
         )
-
-        # HF mask keeps sliding_window including the query
-        self.sliding_window = self.sliding_window - 1
+        if self.is_causal is None:
+            self.is_causal = False
 
 
 class MuseGlimmerAssistantModel(DFlashModel):

@@ -142,7 +142,8 @@ class Mistral3Config(Config):
 
         # New style:  model.language_model.embed_tokens.weight
         # Old style:  language_model.model.embed_tokens.weight
-        self.new_key_style = self.stc.has_tensor("model.language_model.embed_tokens.weight")
+        self.new_key_style = any(
+            self.stc.has_tensor(f"model.language_model.embed_tokens.{t}") for t in ("weight", "trellis"))
 
 class Mistral3Model(Model):
     config_class = Mistral3Config
@@ -381,7 +382,7 @@ class Mistral3VisionModel(Model):
                 key_up = "linear_1",
                 key_down = "linear_2",
                 hidden_size = config.vision.hidden_size,
-                intermediate_size = 5120,  # This seems to be hard coded?
+                intermediate_size = config.hidden_size,
                 out_size = config.hidden_size,
                 activation_fn = "gelu",
                 qmap = "block",

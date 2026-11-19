@@ -1,11 +1,13 @@
 import os
 
 import torch
+from ...util.backend import DSA_MQA, DSA_N_SPLITS, DSA_SPLIT_WARPS
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
-from .bc_attn import _compile_kernel
+from .bc_attn import _compile_kernel, BCKernelTooLarge
+from . import dsa_mqa
 from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
 
 """
@@ -26,8 +28,22 @@ bc_dsa_enable = os.environ.get("EXL3_BC_DSA", "1") != "0"
 _bc_debug = os.environ.get("EXL3_BC_DSA_DEBUG", "0") != "0"
 
 MAX_QLEN = 16
-N_SPLITS = 16
+MAX_S = 16        # tokens per job per batched step; must match BC_DSV4BatchAttention::MAX_S
+# Key splits per decode row (util/backend.py)
+N_SPLITS = DSA_N_SPLITS
 BLOCK_H = 16
+
+
+def _compile_split(dev, sig_s: dict, consts_s: dict):
+    """The decode split kernel: on ROCm the MQA kernel (dsa_mqa.py) where the shape allows it, else upstream's
+    at 8 warps, which spills far less to scratch on these parts"""
+    if DSA_MQA:
+        t = dsa_mqa.decode_eligible(consts_s)
+        if t is not None:
+            sig = dict(sig_s) | {n: "constexpr" for n in ("HP", "BD", "KC", "KSTAGES")}
+            return _compile_kernel(dev, dsa_mqa._dsa_decode_mqa_kernel, sig, dsa_mqa.decode_consts(consts_s, t),
+                                   dsa_mqa.DECODE_WARPS, 1)
+    return _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, DSA_SPLIT_WARPS, 2)
 
 
 def _exl3_bc(lin):
@@ -53,6 +69,7 @@ class BCDsa:
         self.has_comp = m.compressor is not None
         self.has_idx = m.indexer is not None
         self.kl = kl
+        self.pool_bits = kl.k_bits if (self.has_comp and kl.quant) else 0
         self.epp = kl.epp if self.has_comp else PAGE_SIZE
         self.slot = rs.slot
         slot = rs.slot
@@ -142,13 +159,13 @@ class BCDsa:
             m.indexer.bc if self.has_idx else None,
             mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh, m.woa_indices,
             mu.K, mu.mcg, mu.mul1,
-            m.q_norm.weight.data, m.q_ones, m.kv_norm_w,
+            m.q_norm.weight.data, m.q_ones if m.q_head_norm else m.q_ones.new_empty(0), m.kv_norm_w,
             m._rope_type(), m._rope_type_neg(), m.sinks,
             rsl.ring[slot],
             rsl.comp_buf_kv[slot] if self.has_comp else None,
             rsl.comp_buf_gate[slot] if self.has_comp else None,
             rsl.comp_ovl[slot] if (self.has_comp and rsl.comp_ovl is not None) else None,
-            kl.pool_c.view(-1, kl.D_c) if self.has_comp else None,
+            kl.pool_c_view() if self.has_comp else None,
             kl.pool_r.view(-1, kl.D_r) if self.has_comp else None,
             rsl.idx_buf_kv[slot] if self.has_idx else None,
             rsl.idx_buf_gate[slot] if self.has_idx else None,
@@ -167,8 +184,18 @@ class BCDsa:
             self.fan["svh"] if self.fan else None,
             self.fan["n"] if self.fan else None,
             self.fan["idx"] if self.fan else None,
+            *self._pool_quant_args(kl, (MAX_QLEN // self.m_rate + 1, self.head_dim), "bcd_stage"),
         )
         self.scores_max = -(-cap // 128) * 128
+
+    def _pool_quant_args(self, kl, stage_shape, tag):
+        """Packed-pool extras for the C++ graph: scales, per-step fp16 staging static (the
+        compressor emits this step's entries there, quantize + scatter follows), H32, bits."""
+        if not (self.has_comp and kl.quant):
+            return None, None, None, 0
+        from .triton_paged import _get_h32
+        stage = g_tensor_cache.get(self.device, stage_shape, torch.half, tag)
+        return kl.pool_s.view(-1, kl.G), stage, _get_h32(self.device), kl.k_bits
 
     def _configure(self, seq, regime):
         dev = self.device
@@ -224,8 +251,10 @@ class BCDsa:
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
 
         hb = -(-H // BLOCK_H)
-        ws_ml = st((seq * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")
-        ws_acc = st((seq * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")
+        # Split-decode partials: one backing per device sized for the largest slot, viewed to
+        # this slot's rows.
+        ws_ml = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")[:seq * hb * N_SPLITS * BLOCK_H * 2]
+        ws_acc = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")[:seq * hb * N_SPLITS * BLOCK_H * D]
         attn_out = st((G, seq, hpg * hd), torch.half, "bcd_aout")
         woa_c = st((G, seq, self.o_lora), torch.half, "bcd_woac")
         woa_t = st((seq, G * self.o_lora), torch.half, "bcd_woat")
@@ -235,15 +264,17 @@ class BCDsa:
         D_c = hd - self.rd
         kp = -(-self.module.index_topk // 32) * 32 if self.has_idx else 32
         sig_s = {
-            "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16", "pool_c": "*fp16:16",
+            "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16",
+            "pool_c": "*i32:16" if self.pool_bits else "*fp16:16",
             "pool_r": "*fp16:16", "block_table": "*i32:16", "indices": "*i32:16",
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16",
             "k_len": "i32", "win_len": "i32", "pool_len": "i32",
             "num_pages_per_row": "i32", "q_pos0": "i32", "win_floor": "i32", "ring_beg": "i32",
             "slot_ids": "i32", "ring_stride": "i32",
+            "pool_s": "*fp16:16", "h32": "*fp16:16",
         } | {n: "constexpr" for n in (
             "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
-            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES")}
+            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC")}
         consts_s = dict(
             H = H, page_size = self.epp, D_c = D_c,
             D_c_pad = 1 << (D_c - 1).bit_length(), D_r = self.rd, K_pad = kp,
@@ -251,20 +282,22 @@ class BCDsa:
             HAS_WINDOW = True, DENSE_POOL = regime == 0,
             BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
             SEQ = 1, MULTIROW = 0, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
+            Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
-        k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+        k_split = _compile_split(dev, sig_s, consts_s)
 
         sig_c = {
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
             "derot_inv_freq": "*fp32:16",
             "out": "*fp16:16", "q_pos0": "i32", "R": "i32", "n_splits": "i32",
+            "h32": "*fp16:16",
         } | {n: "constexpr" for n in (
             "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
-            "SEQ", "MULTIROW")}
+            "SEQ", "MULTIROW", "OUT_LATENT", "QC")}
         consts_c = dict(
             H = H, D_c = D_c, D_r = self.rd, HAS_SINKS = True, DEROTATE = True,
             HPG = hpg, BLOCK_H = BLOCK_H, BLOCK_D = 128,
-            SEQ = 1, MULTIROW = 0,
+            SEQ = 1, MULTIROW = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
         k_combine = _compile_kernel(dev, _dsa_attn_combine_kernel, sig_c, consts_c, 4, 2)
 
@@ -302,7 +335,10 @@ class BCDsa:
             return None
 
         if self.bc.needs_configure(seq, regime):
-            self._configure(seq, regime)
+            try:
+                self._configure(seq, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
 
         # Refresh the block-table static once per job step (any compressor layer may be the
         # one to do it; sliding layers never touch it, so this is tracked separately from
@@ -362,6 +398,7 @@ class BCDsaBatch:
         self.has_comp = m.compressor is not None
         self.has_idx = m.indexer is not None
         self.kl = kl
+        self.pool_bits = kl.k_bits if (self.has_comp and kl.quant) else 0
         self.epp = kl.epp if self.has_comp else PAGE_SIZE
         self.kp = -(-m.index_topk // 32) * 32 if self.has_idx else 32
 
@@ -437,7 +474,7 @@ class BCDsaBatch:
             mu.K, mu.mcg, mu.mul1,
             self.fan["trellis"], self.fan["suh"], self.fan["svh"],
             self.fan["n"], self.fan["idx"], fk.K, fk.mcg, fk.mul1,
-            m.q_norm.weight.data, m.q_ones, m.kv_norm_w,
+            m.q_norm.weight.data, m.q_ones if m.q_head_norm else m.q_ones.new_empty(0), m.kv_norm_w,
             m._rope_type(), m._rope_type_neg(), m.sinks,
             comp.ape if self.has_comp else None,
             comp.fused_norm_w if self.has_comp else None,
@@ -451,7 +488,7 @@ class BCDsaBatch:
             rsl.comp_buf_kv if self.has_comp else None,
             rsl.comp_buf_gate if self.has_comp else None,
             rsl.comp_ovl if (self.has_comp and rsl.comp_ovl is not None) else None,
-            kl.pool_c.view(-1, kl.D_c) if self.has_comp else None,
+            kl.pool_c_view() if self.has_comp else None,
             kl.pool_r.view(-1, kl.D_r) if self.has_comp else None,
             rsl.idx_buf_kv if self.has_idx else None,
             rsl.idx_buf_gate if self.has_idx else None,
@@ -473,6 +510,7 @@ class BCDsaBatch:
             self.fan2["K"] if self.fan2 else 0,
             self.fan2["mcg"] if self.fan2 else False,
             self.fan2["mul1"] if self.fan2 else False,
+            *BCDsa._pool_quant_args(self, kl, (self.MAX_B, MAX_S // self.m_rate + 1, self.head_dim), "bcdb_stage"),
         )
         cap = kl.capacity if self.has_comp else PAGE_SIZE
         self.scores_max = -(-cap // 128) * 128
@@ -539,15 +577,17 @@ class BCDsaBatch:
 
         D_c = hd - self.rd
         sig_s = {
-            "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16", "pool_c": "*fp16:16",
+            "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16",
+            "pool_c": "*i32:16" if self.pool_bits else "*fp16:16",
             "pool_r": "*fp16:16", "block_table": "*i32:16", "indices": "*i32:16",
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16",
             "k_len": "*i32:16", "win_len": "i32", "pool_len": "*i32:16",
             "num_pages_per_row": "i32", "q_pos0": "*i32:16", "win_floor": "*i32:16",
             "ring_beg": "*i32:16", "slot_ids": "*i32:16", "ring_stride": "i32",
+            "pool_s": "*fp16:16", "h32": "*fp16:16",
         } | {n: "constexpr" for n in (
             "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
-            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES")}
+            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC")}
         consts_s = dict(
             H = H, page_size = self.epp, D_c = D_c,
             D_c_pad = 1 << (D_c - 1).bit_length(), D_r = self.rd, K_pad = self.kp,
@@ -555,20 +595,22 @@ class BCDsaBatch:
             HAS_WINDOW = True, DENSE_POOL = not self.has_idx,
             BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
             SEQ = S, MULTIROW = 1, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
+            Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
-        k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
+        k_split = _compile_split(dev, sig_s, consts_s)
 
         sig_c = {
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
             "derot_inv_freq": "*fp32:16",
             "out": "*fp16:16", "q_pos0": "*i32:16", "R": "i32", "n_splits": "i32",
+            "h32": "*fp16:16",
         } | {n: "constexpr" for n in (
             "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
-            "SEQ", "MULTIROW")}
+            "SEQ", "MULTIROW", "OUT_LATENT", "QC")}
         consts_c = dict(
             H = H, D_c = D_c, D_r = self.rd, HAS_SINKS = True, DEROTATE = True,
             HPG = hpg, BLOCK_H = BLOCK_H, BLOCK_D = 128,
-            SEQ = S, MULTIROW = 1,
+            SEQ = S, MULTIROW = 1, OUT_LATENT = 0, QC = self.pool_bits,
         )
         k_combine = _compile_kernel(dev, _dsa_attn_combine_kernel, sig_c, consts_c, 4, 2)
 
@@ -594,7 +636,10 @@ class BCDsaBatch:
         """x (B, S, hidden) fp16 contiguous, bt (rows, npr) i32 device batch block table.
         Returns y (B, S, hidden) fp32 (a static: consume before the next BC call)."""
         if self.bc.needs_configure(B, S):
-            self._configure(B, S)
+            try:
+                self._configure(B, S)
+            except BCKernelTooLarge:
+                return None
 
         pin = self.pins[self.pin_i]
         self.pin_i = (self.pin_i + 1) % len(self.pins)

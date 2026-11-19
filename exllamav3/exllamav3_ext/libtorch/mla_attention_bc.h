@@ -61,6 +61,7 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("xh"),
     py::arg("h32")
 )
+
 .def("needs_configure", &BC_MLAttention::needs_configure)
 .def("configure_slot", &BC_MLAttention::configure_slot,
     py::arg("bsz"),
@@ -91,4 +92,5 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("absorb_gy"),
     py::arg("unfold_gx")
 )
+
 .def("run", &BC_MLAttention::run);

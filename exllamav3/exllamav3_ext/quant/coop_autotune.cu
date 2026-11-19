@@ -24,7 +24,7 @@
 namespace
 {
 
-constexpr uint64_t COOP_AUTOTUNE_VERSION = 3;
+constexpr uint64_t COOP_AUTOTUNE_VERSION = 4;
 constexpr char DISK_CACHE_MAGIC[8] = { 'E', 'X', '3', 'A', 'T', 'U', 'N', 'E' };
 constexpr uint32_t DISK_CACHE_FORMAT = 1;
 
@@ -64,6 +64,14 @@ std::set<std::tuple<int, void*, size_t>> attr_set;
 std::mutex disk_mutex;
 bool disk_cache_loaded = false;
 std::map<uint64_t, DiskCacheRecordV1> disk_cache;
+
+// EXL3_DEBUG_AUTOTUNE: print every probe/measurement launch and synchronize after it, so a launch that
+// never completes (a grid-barrier kernel past true co-residency) is named instead of hanging silently
+static bool debug_autotune()
+{
+    static const bool v = std::getenv("EXL3_DEBUG_AUTOTUNE") != nullptr;
+    return v;
+}
 
 uint64_t salt_hash(uint64_t hash)
 {
@@ -148,6 +156,14 @@ void load_disk_cache_locked()
     std::vector<char> record_bytes(header.record_size);
     while (in.read(record_bytes.data(), header.record_size))
     {
+        // An embedded header (two processes appended their first record concurrently): rewind to
+        // just after it and keep reading records from there
+        if (header.record_size >= sizeof(DiskCacheHeader) &&
+            std::memcmp(record_bytes.data(), DISK_CACHE_MAGIC, sizeof(DISK_CACHE_MAGIC)) == 0)
+        {
+            in.seekg(-(std::streamoff)(header.record_size - sizeof(DiskCacheHeader)), std::ios::cur);
+            continue;
+        }
         DiskCacheRecordV1 record;
         std::memcpy(&record, record_bytes.data(), sizeof(record));
         disk_cache[record.hash] = record;
@@ -176,16 +192,22 @@ void append_disk_cache_locked(const DiskCacheRecordV1& record)
     std::ofstream out(path, std::ios::binary | std::ios::app);
     if (!out) return;
 
+    // Header and first record go out in one write so a concurrent first writer can never split them;
+    // if two processes both see an empty file, the second header lands between records and the
+    // reader skips it (load_disk_cache_locked)
     if (write_header)
     {
         DiskCacheHeader header;
         std::memcpy(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic));
         header.format = DISK_CACHE_FORMAT;
         header.record_size = sizeof(DiskCacheRecordV1);
-        out.write((const char*) &header, sizeof(header));
+        char buf[sizeof(header) + sizeof(record)];
+        std::memcpy(buf, &header, sizeof(header));
+        std::memcpy(buf + sizeof(header), &record, sizeof(record));
+        out.write(buf, sizeof(buf));
     }
-
-    out.write((const char*) &record, sizeof(record));
+    else
+        out.write((const char*) &record, sizeof(record));
 }
 
 bool launch_from_disk_cache
@@ -393,7 +415,7 @@ void measure_candidate_sample
     cuda_check(cudaEventRecord(start, stream));
     for (int i = 0; i < repeats; ++i)
     {
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(EXL3_COOP_LAUNCH
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -402,6 +424,14 @@ void measure_candidate_sample
             smem,
             stream
         ));
+        if (debug_autotune())
+        {
+            fprintf(stderr, "[measure] grid=%dx%d block=%d rep=%d/%d ... ",
+                    candidate.num_sms, candidate.concurrency, candidate.block_dim, i + 1, repeats);
+            fflush(stderr);
+            cuda_check(cudaStreamSynchronize(stream));
+            fprintf(stderr, "ok\n");
+        }
     }
     cuda_check(cudaEventRecord(end, stream));
     cuda_check(cudaEventSynchronize(end));
@@ -451,7 +481,7 @@ void measure_stage
         set_kernel_attr_once(candidate.kernel, smem);
 
         // One untimed launch avoids first-use effects from contaminating the first measured round.
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(EXL3_COOP_LAUNCH
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -460,6 +490,14 @@ void measure_stage
             smem,
             stream
         ));
+        if (debug_autotune())
+        {
+            fprintf(stderr, "[autotune probe] kernel=%p grid=%dx%dx%d block=%d smem=%zu ... ",
+                    candidate.kernel, candidate.num_sms, 1, candidate.concurrency, candidate.block_dim, smem);
+            fflush(stderr);
+            cuda_check(cudaStreamSynchronize(stream));
+            fprintf(stderr, "ok\n");
+        }
     }
     cuda_check(cudaStreamSynchronize(stream));
 
@@ -593,7 +631,7 @@ bool CoopKernelAutotuner::launch_locked
     }
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(EXL3_COOP_LAUNCH
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -627,7 +665,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     {
         launch_cache[salted_hash] = launch_config;
         set_kernel_attr_once(launch_config.kernel, smem);
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(EXL3_COOP_LAUNCH
         (
             launch_config.kernel,
             dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -647,7 +685,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     store_disk_cache(salted_hash, launch_config);
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(EXL3_COOP_LAUNCH
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),

@@ -74,7 +74,10 @@ void dsv4_compress_windows_kernel
     const int db_stride,
     const int* __restrict__ pool_bt,     // paged pools: block table (one row per job), else nullptr
     const int bt_stride,                 // paged pools, batched: block table row stride
-    const int epp                        // paged pools: entries per page
+    const int epp,                       // paged pools: entries per page
+    const bool stage_rel                 // dest_a is a per-JOB staging buffer of this step's
+                                         // entries at rows [0, nw) (packed-pool quantization
+                                         // follows); dest_b / pool_bt unused
 )
 {
     extern __shared__ float sh[];        // comp[hd] + reduce[hd / 32]
@@ -96,7 +99,7 @@ void dsv4_compress_windows_kernel
         if (ovl) ovl += (size_t) slot * ovl_stride;
         if (!pool_bt)
         {
-            dest_a += (size_t) slot * da_stride;
+            dest_a += (size_t) (stage_rel ? job : slot) * da_stride;
             if (dest_b) dest_b += (size_t) slot * db_stride;
         }
     }
@@ -191,15 +194,15 @@ void dsv4_compress_windows_kernel
     {
         int p = (c - c0) / 2;
         float theta = inv_freq[p] * (float) ((ec0 + w) * m);
-        float cs = __cosf(theta);
-        float sn = __sinf(theta);
+        float cs, sn;
+        sincos_accurate(theta, &sn, &cs);
         float v_e = sh_comp[c0 + p * 2];
         float v_o = sh_comp[c0 + p * 2 + 1];
         out = ((c - c0) & 1) ? (v_o * cs + v_e * sn) : (v_e * cs - v_o * sn);
     }
 
-    size_t drow = (size_t) (ec0 + w);
-    if (pool_bt)
+    size_t drow = stage_rel ? (size_t) w : (size_t) (ec0 + w);
+    if (pool_bt && !stage_rel)
         drow = (size_t) pool_bt[drow / epp] * epp + drow % epp;
     if (!dest_b || c < Wa)
         dest_a[drow * Wa + c] = __float2half_rn(out);
@@ -335,11 +338,13 @@ void dsv4_ring_append_gr
         TORCH_CHECK_DTYPE(slot_ids.value(), kInt);
         slot_ids_ptr = (const int*) slot_ids.value().data_ptr();
         batch = (int) slot_ids.value().size(0);
+        if (!batch) return;
         seq /= batch;
         ring_rows = (int) ring.size(1);
         ring_stride = ring_rows * D;
     }
     size_t total = (size_t) seq * D;
+    if (!total) return;
     dsv4_ring_append_kernel<<<dim3(CEIL_DIVIDE(total, NUM_THREADS_STORE), batch), NUM_THREADS_STORE, 0, stream>>>
     (
         (const half*) kv.data_ptr(), (half*) ring.data_ptr(),
@@ -381,7 +386,8 @@ void dsv4_compress_gr
     Graph* graph,
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
-    int pool_epp
+    int pool_epp,
+    bool stage_rel
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(kv_new.device());
@@ -406,12 +412,16 @@ void dsv4_compress_gr
     int Wa = dest_a.size(-1);
     int hd = Wa + (dest_b ? dest_b.value().size(-1) : 0);
     int rd = inv_freq.size(0) * 2;
+    TORCH_CHECK(hd > 0, "dsv4_compress: RMS norm over an empty head dim");
     bool overlap = W == 2 * hd;
     TORCH_CHECK(overlap || W == hd, "dsv4_compress: W must be hd or 2 * hd");
     TORCH_CHECK(norm_w.size(0) == hd, "dsv4_compress: norm weight size mismatch");
     TORCH_CHECK(rd % 2 == 0 && rd <= hd && hd <= 1024, "dsv4_compress: bad dims");
     TORCH_CHECK(!overlap || ovl, "dsv4_compress: overlapping mode requires snapshot ring");
+    TORCH_CHECK(m > 0, "dsv4_compress: empty compression window (m must be positive)");
+    TORCH_CHECK(buf_rows > 0, "dsv4_compress: empty ring");
     int ovl_depth = ovl ? (int) ovl.value().size(slot_ids ? 1 : 0) : 1;
+    TORCH_CHECK(ovl_depth > 0, "dsv4_compress: empty snapshot ring");
     if (ovl)
     {
         TORCH_CHECK_DTYPE(ovl.value(), kFloat);
@@ -436,11 +446,14 @@ void dsv4_compress_gr
         TORCH_CHECK(pos_ptr, "dsv4_compress: batched mode requires position_tensor");
         slot_ids_ptr = (const int*) slot_ids.value().data_ptr();
         batch = (int) slot_ids.value().size(0);
+        if (!batch) return;
         seq /= batch;                       // kv_new is (B * seq, W)
         ring_stride = buf_rows * W;
+        TORCH_CHECK(!ovl || ovl.value().size(0) > 0, "dsv4_compress: empty snapshot ring");
         ovl_stride = ovl ? (int) (ovl.value().numel() / ovl.value().size(0)) : 0;
         if (!pool_bt)
         {
+            TORCH_CHECK(dest_a.size(0) > 0 && (!dest_b || dest_b.value().size(0) > 0), "dsv4_compress: empty destination");
             da_stride = (int) (dest_a.numel() / dest_a.size(0));
             db_stride = dest_b ? (int) (dest_b.value().numel() / dest_b.value().size(0)) : 0;
         }
@@ -460,6 +473,9 @@ void dsv4_compress_gr
             bt_stride = (int) pool_bt.value().size(1);
         }
     }
+
+    if (!seq) return;
+    TORCH_CHECK(!pool_bt || pool_bt.value().numel() > 0, "dsv4_compress: rows to compress but no pages in block table");
 
     int nw = (position + seq) / m - position / m;
     int grid_w = pos_ptr ? seq / m + 1 : nw;
@@ -486,13 +502,14 @@ void dsv4_compress_gr
             seq, m, buf_rows, ovl_depth, W, hd, rd, Wa,
             overlap,
             slot_ids_ptr, ring_stride, ovl_stride, da_stride, db_stride,
-            pool_bt_ptr, bt_stride, pool_epp
+            pool_bt_ptr, bt_stride, pool_epp, stage_rel
         );
         cuda_check(cudaPeekAtLastError());
     }
 
     int j0 = seq > buf_rows ? seq - buf_rows : 0;
     size_t total = (size_t) (seq - j0) * W;
+    if (!total) return;
     dsv4_compress_store_kernel<<<dim3(CEIL_DIVIDE(total, NUM_THREADS_STORE), batch), NUM_THREADS_STORE, 0, stream>>>
     (
         (const half*) kv_new.data_ptr(),
@@ -526,7 +543,8 @@ void dsv4_compress
     int m,
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
-    int pool_epp
+    int pool_epp,
+    bool stage_rel
 )
 {
     dsv4_compress_gr
@@ -548,6 +566,7 @@ void dsv4_compress
         nullptr,
         slot_ids,
         pool_bt,
-        pool_epp
+        pool_epp,
+        stage_rel
     );
 }

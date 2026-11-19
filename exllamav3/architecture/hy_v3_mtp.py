@@ -222,13 +222,5 @@ class HyV3MTPModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        if not self.attached_model().loaded_tp:
-            ll = self.attached_model().logit_layer_idx
-            lm = self.attached_model().modules[ll]
-            logits = lm.prepare_for_device(state, params)
-            logits = lm.forward(logits, params)
-            return torch.argmax(logits, dim = -1)
-        else:
-            state = self.attached_model().tp_producer.send(state)
-            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
-            return argmax
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)

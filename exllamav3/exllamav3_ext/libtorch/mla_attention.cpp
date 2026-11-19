@@ -60,6 +60,7 @@ BC_MLAttention::BC_MLAttention
     norm_eps            (_norm_eps),
     inv_freq            (std::move(_inv_freq)),
     rope_style          (_rope_style),
+    rope_active         (_qk_rope_head_dim > 0 && _rope_style != 0),
     attn_factor         (_attn_factor),
     rotate_dims         (_rotate_dims),
     l4_scaling_beta     (_l4_scaling_beta),
@@ -159,6 +160,7 @@ void BC_MLAttention::configure_slot
     s.configured = true;
 }
 
+
 // Live split configuration from the current block-table bound. Mirrors the dispatch wrapper
 // (mla_attn_triton_decode) exactly, so the two paths produce identical numerics; note the MLA
 // bound is num_pages * page_size, without the q_len term the MHA path adds
@@ -240,7 +242,9 @@ void BC_MLAttention::run_gr
     }
 
     // Partial RoPE on the rope halves, in place on the statics; the position sources are patched
-    // per call and the kernel branches on the pointers at runtime
+    // per call and the kernel branches on the pointers at runtime. NoPE models (GLM5.3,
+    // qk_rope_head_dim 0) skip the stage entirely
+    if (rope_active)
     {
         c10::optional<at::Tensor> out_k = s.kpe4;
         rope_gr(s.q_pe4, s.q_pe4, s.kpe4, out_k, inv_freq, (uint32_t) position, positions, position_ids,
@@ -309,6 +313,7 @@ void BC_MLAttention::run_gr
             graph->record_param(s.k_append->handle(), GP_end, 0);
         }
     }
+
 
     // Flash-decoding split + combine, split configuration derived from the block-table bound
     // per call. The slots compile with FINAL = false, so the combine pass always runs (identical
@@ -403,9 +408,11 @@ void BC_MLAttention::run
     TORCH_CHECK(s.configured, "BC_MLAttention: slot not configured");
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_MLAttention: x and y must be contiguous");
 
+
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // A disabled graph runs the same C++ path eagerly every time
+    if (s.runs == 0 || s.graph->disabled)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, nullptr);
         s.runs = 1;
@@ -441,7 +448,8 @@ void BC_MLAttention::run
     // Latent projection
     params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
 
-    // RoPE position sources
+    // RoPE position sources (NoPE models never captured the stage)
+    if (rope_active)
     {
         params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
         params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);

@@ -1,11 +1,11 @@
 import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant, CacheLayer_fp8, CacheLayer_nvfp4
 from .common import AttnArgs, AttnFn
-from .flash_attn_2 import fn_flash_attn_with_kvcache, fn_flash_attn_func, fn_flash_attn_varlen_func, has_fa2
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
+    has_triton,
     _qc_staging,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
@@ -15,19 +15,11 @@ from .triton_paged import (
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
     fn_triton_attn_nocache,
-    has_triton,
-    _is_power_of_2,
 )
 
-# Candidate attn functions in order of preference. The Triton decode/prefill kernels lead by
-# default (measured faster than FA2 on Ampere/Ada/consumer Blackwell); set EXL3_PREFER_FA2=1 to
-# restore flash-attn priority for A/B testing (read once at import)
-import os
-_prefer_fa2 = os.environ.get("EXL3_PREFER_FA2", "0") != "0"
-if _prefer_fa2 and not has_fa2:
-    print(" !! EXL3_PREFER_FA2 is set but flash-attn is not available; using built-in kernels")
-    _prefer_fa2 = False
-
+# Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
+# serve every shape they support (any head_dim <= 512, zero-padded to a power of two), then the
+# older Triton kernels and the torch/xformers fallbacks for the rest
 _fns_triton_fast: list[AttnFn] = [
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
@@ -56,15 +48,7 @@ _fns_fp8: list[AttnFn] = [
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
-_fns_fa2: list[AttnFn] = [
-    fn_flash_attn_with_kvcache,
-    fn_flash_attn_func,
-    fn_flash_attn_varlen_func,
-]
-
-attn_fns: list[AttnFn] = (
-    (_fns_fa2 + _fns_triton_fast) if _prefer_fa2 else (_fns_triton_fast + _fns_fa2)
-) + [
+attn_fns: list[AttnFn] = _fns_triton_fast + [
     fn_triton_attn_nocache,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
@@ -115,12 +99,16 @@ def attn_dispatch(
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: int | None = None,
     window_size: int | None = None,
+    window_right: int = 0,
+    sink_key0: bool = False,
     softcap: float = 0.0,
     block_table: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
     non_causal_spans: list | None = None,
     sinks: torch.Tensor | None = None,
     dispatch_cache: dict | None = None,
+    max_kv_len: int | None = None,
+    staging_pages: int | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -144,11 +132,11 @@ def attn_dispatch(
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
         if (
-            _qc_attn and has_triton and
+            _qc_attn and
             isinstance(layer, CacheLayer_quant) and
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and
-            dim <= 512 and _is_power_of_2(dim) and
+            dim <= 512 and dim % 32 == 0 and   # packed groups of 32; non-pow2 dims run zero-padded
             cu_seqlens is None
         ):
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
@@ -210,8 +198,11 @@ def attn_dispatch(
         non_causal_spans,
         q_cache,
         sinks,
-        k_scales,
-        v_scales,
+        k_scales, v_scales,
+        max_kv_len = max_kv_len,
+        window_right = window_right,
+        sink_key0 = sink_key0,
+        staging_pages = staging_pages,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
