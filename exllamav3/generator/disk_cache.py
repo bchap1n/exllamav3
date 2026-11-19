@@ -39,6 +39,41 @@ _HEADER = struct.Struct("<II")       # (header json length, payload-descriptor l
 _STRAY_AGE = 600
 _TOUCH_INTERVAL = 60
 
+
+def _pid_running(pid: int) -> bool | None:
+    """
+    Whether the process runs, or None where it cannot be checked. Never signals the process: on Windows
+    os.kill(pid, 0) calls TerminateProcess, so liveness is read from a synchronize-only handle instead.
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x102
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        h = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not h:
+            # Access denied means the process exists, just not ours to open
+            return ctypes.get_last_error() == 5
+        try:
+            return kernel32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(h)
+    if hasattr(os, "kill"):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+    return None
+
+
 # Bump when a change to the code alters the bytes of a page image or a checkpoint (a kernel or module computing
 # K/V differently, a new checkpoint layout). Part of the fingerprint, so existing caches are left alone until
 # then; the version string and the model/cache identity cover the rest
@@ -799,16 +834,10 @@ class DiskPageCache:
         """A budget declaration counts while the process that made it runs (same host). Where that cannot be
         checked, while its directory was in use recently, by the stray rule"""
         pid = declared.get("pid")
-        if isinstance(pid, int) and hasattr(os, "kill") and os.name != "nt":
-            try:
-                os.kill(pid, 0)
-                return True
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True
-            except OSError:
-                pass
+        if isinstance(pid, int):
+            live = _pid_running(pid)
+            if live is not None:
+                return live
         index = os.path.join(path, "index.sqlite")
         try:
             used = os.path.getmtime(index) if os.path.exists(index) else float(declared.get("time", 0))
@@ -823,8 +852,10 @@ class DiskPageCache:
         bf = os.path.join(self.dir, "budget.json")
         try:
             with open(bf) as f:
-                if json.load(f).get("pid") == os.getpid():
-                    os.remove(bf)
+                owned = json.load(f).get("pid") == os.getpid()
+            # The handle must be closed before the remove: Windows refuses to unlink an open file
+            if owned:
+                os.remove(bf)
         except (OSError, ValueError):
             pass
 
